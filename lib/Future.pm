@@ -733,6 +733,118 @@ Returns the C<$future>.
 
 =cut
 
+=head2 safe_cancel
+
+   $cleanup_f = $future->safe_cancel;
+
+Requests an B<asynchronous> cancellation of the future. Unlike L</cancel>, which
+marks the future ready at once, C<safe_cancel> first runs any asynchronous
+cleanup associated with the future (and any futures chained to it via
+L</AWAIT_CHAIN_SAFE_CANCEL>) to completion, and only then cancels. It returns a
+new C<Future> that completes once that cleanup has finished.
+
+   await $future->safe_cancel;
+
+A plain C<Future> has no asynchronous cleanup of its own, so unless other
+futures have been chained below it this behaves just like L</cancel>, returning
+an already-complete C<Future>. Subclasses with asynchronous teardown (for
+example L<Future::With>) hook in by overriding L</_safe_cancel_cleanup>.
+
+This is used by L<Future::AsyncAwait> to let C<await> transparently wait for
+asynchronous cleanup when an C<async sub>'s returning future is safe-cancelled;
+see L<Future::AsyncAwait::Awaitable/safe_cancel>.
+
+=cut
+
+sub safe_cancel
+{
+   my $self = shift;
+
+   return Future->done if $self->is_ready;
+
+   # Safe-cancel state is kept via set_udata/udata rather than by treating the
+   # instance as a hash, so this works on both the pure-perl and the XS backend
+   # (where instances are not hash references).
+
+   # A safe_cancel already under way: hand back its cleanup Future.
+   return $self->udata( "safe_disposal" ) || Future->done
+      if $self->udata( "safe_cancelling" );
+
+   my @cleanup = $self->_safe_cancel_cleanup;     # our own async teardown, if any
+   my $children = $self->udata( "safe_children" );
+   my $has_children = $children && @$children;
+
+   # Nothing asynchronous to wait for. Behave as a prompt cancel - but if a
+   # parent is orchestrating the teardown, leave the actual cancellation to it
+   # (so it cancels us, and thus resumes any awaiting frame, only once the whole
+   # chain has been cleaned up and the parent itself is cancelled).
+   unless( @cleanup || $has_children ) {
+      $self->cancel unless $self->udata( "safe_parent_driven" );
+      return Future->done;
+   }
+
+   $self->set_udata( safe_cancelling => 1 );
+
+   my @await = @cleanup;
+   if( $has_children ) {
+      foreach my $child ( @$children ) {
+         next unless defined $child;     # weakly held; skip if already reaped
+         next if $child->is_ready;
+         push @await, $child->safe_cancel;
+      }
+   }
+
+   my $all = @await ? Future->wait_all( @await ) : Future->done;
+   $self->set_udata( safe_disposal => $all );
+
+   # Once cleanup completes, become cancelled - which (via the ordinary cancel
+   # chain wired by AWAIT_CHAIN_CANCEL) tears the children down promptly, in the
+   # right order. A parent-driven future leaves this to its parent.
+   unless( $self->udata( "safe_parent_driven" ) ) {
+      $all->on_ready( sub { $self->cancel unless $self->is_ready } );
+   }
+
+   return $all;
+}
+
+=head2 AWAIT_CHAIN_SAFE_CANCEL
+
+   $f1->AWAIT_CHAIN_SAFE_CANCEL( $f2 );
+
+The asynchronous-cancellation companion to L</AWAIT_ON_CANCEL>/C<AWAIT_CHAIN_CANCEL>.
+Attaches C<$f2> so that when C<$f1> is L<safe-cancelled|/safe_cancel>, C<$f2> is
+safe-cancelled too and its cleanup awaited before C<$f1> becomes cancelled. See
+L<Future::AsyncAwait::Awaitable/AWAIT_CHAIN_SAFE_CANCEL> for the ordering
+contract. (The prompt cancel chain is wired separately via C<AWAIT_CHAIN_CANCEL>.)
+
+=cut
+
+sub AWAIT_CHAIN_SAFE_CANCEL
+{
+   my ( $self, $f2 ) = @_;
+   my $children = $self->udata( "safe_children" );
+   $self->set_udata( safe_children => $children = [] ) unless $children;
+   push @$children, $f2;
+   # Hold the child weakly. The prompt cancel chain (AWAIT_CHAIN_CANCEL, wired
+   # alongside this one) keeps it alive while pending and revokes when ready, and
+   # safe_cancel only needs the child before readiness - so an extra strong ref
+   # here would merely outlive the await (cf. Future::AsyncAwait's t/31destroy).
+   Scalar::Util::weaken( $children->[-1] );
+   # Defer $f2's terminal cancellation to us. Use a method (not a direct field)
+   # so this works across Future subclasses (e.g. Future::With's guard).
+   $f2->_safe_set_parent_driven if blessed $f2 and $f2->can( "_safe_set_parent_driven" );
+   return;
+}
+
+# Marks this future as driven by a parent's safe_cancel: it will not cancel
+# itself when its cleanup completes, leaving that to the parent's cancel chain.
+sub _safe_set_parent_driven { $_[0]->set_udata( safe_parent_driven => 1 ) }
+
+# Hook for subclasses with their own asynchronous teardown (e.g. Future::With's
+# DESTROY_ASYNC). Returns a list of cleanup Futures to await before cancelling.
+# A plain Future has none.
+sub _safe_cancel_cleanup { return }
+
 =head1 SEQUENCING METHODS
 
 The following methods all return a new future to represent the combination of

@@ -36,6 +36,9 @@ t/06followed_by.pl
 t/07catch-pp.t
 t/07catch-xs.t
 t/07catch.pl
+t/08safe_cancel-pp.t
+t/08safe_cancel-xs.t
+t/08safe_cancel.pl
 t/09transform-pp.t
 t/09transform-xs.t
 t/09transform.pl
